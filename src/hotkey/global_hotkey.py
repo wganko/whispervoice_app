@@ -232,28 +232,53 @@ class GlobalHotkeyManager:
         return self._running
 
 
+import time
+
 class RecordingToggle:
     """録音トグル制御"""
     
     def __init__(
         self,
         on_start: Optional[Callable[[], None]] = None,
-        on_stop: Optional[Callable[[], None]] = None
+        on_stop: Optional[Callable[[], None]] = None,
+        debounce_ms: int = 500  # デバウンス時間（ミリ秒）
     ):
         self.on_start = on_start
         self.on_stop = on_stop
         self._is_recording = False
+        self._last_toggle_time = 0.0
+        self._debounce_ms = debounce_ms
+        
+    def _check_debounce(self) -> bool:
+        """デバウンスチェック"""
+        current_time = time.time() * 1000
+        if current_time - self._last_toggle_time < self._debounce_ms:
+            return False
+        self._last_toggle_time = current_time
+        return True
         
     def toggle(self) -> bool:
         """録音状態をトグル"""
+        if not self._check_debounce():
+            return self._is_recording
+            
         if self._is_recording:
             self._is_recording = False
             if self.on_stop:
-                self.on_stop()
+                try:
+                    self.on_stop()
+                except Exception as e:
+                    logging.getLogger(__name__).error(f"録音停止エラー: {e}")
         else:
             self._is_recording = True
             if self.on_start:
-                self.on_start()
+                try:
+                    self.on_start()
+                except Exception as e:
+                    logging.getLogger(__name__).error(f"録音開始エラー: {e}")
+                    # エラー時は録音状態を戻す
+                    self._is_recording = False
+                    
         return self._is_recording
         
     @property
