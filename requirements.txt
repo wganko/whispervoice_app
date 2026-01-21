@@ -1,0 +1,21 @@
+# Audio capture
+PyAudioWPatch>=0.2.12
+
+# Audio processing
+numpy>=1.24.0
+scipy>=1.10.0
+resampy>=0.4.2
+
+# VAD
+torch>=2.0.0
+silero-vad>=4.0.0
+
+# Speech-to-text
+faster-whisper>=0.10.0
+
+# Windows API
+pywin32>=306
+pynput>=1.7.6
+
+# Testing
+pytest>=7.4.0
