@@ -6,7 +6,8 @@ F8 キーで録音を開始/停止し、音声認識結果をアクティブウ�
 
 import sys
 import logging
-import signal
+import time
+import threading
 from typing import Optional
 
 from src.audio import WasapiCapture
@@ -59,6 +60,7 @@ class VoiceInputAgent:
         self._latency_logger: Optional[LatencyLogger] = None
         
         self._running = False
+        self._stop_event = threading.Event()
         
     def _init_components(self) -> None:
         """コンポーネントを初期化"""
@@ -88,8 +90,8 @@ class VoiceInputAgent:
             language="ja"
         )
         
-        # テキスト注入
-        self._injector = TextInjector()
+        # テキスト注入（IME 対応のため遅延を追加）
+        self._injector = TextInjector(delay_between_chars_ms=5.0)
         
         # 音声アキュムレータ
         self._accumulator = AudioAccumulator()
@@ -168,28 +170,67 @@ class VoiceInputAgent:
             timer.mark(MeasurementPoint.STT_END)
             
             if result.text:
-                logger.info(f"認識結果: {result.text}")
+                # テキストをクリーンアップ（余分な空白や特殊文字を除去）
+                clean_text = result.text.strip()
                 
-                # テキスト注入
-                timer.mark(MeasurementPoint.INJECTION_START)
-                injection_result = self._injector.inject(result.text)
-                timer.mark(MeasurementPoint.INJECTION_END)
-                
-                if injection_result.success:
-                    logger.info(f"✓ テキスト注入完了 ({len(result.text)} 文字)")
-                else:
-                    logger.warning(f"テキスト注入に失敗: {injection_result.failed_characters}")
+                # 幻覚的なテキストのフィルタリング
+                if self._is_valid_text(clean_text):
+                    logger.info(f"認識結果: {clean_text}")
                     
-                # レイテンシ記録
-                measurement = timer.get_measurement(text_length=len(result.text))
-                self._latency_logger.log(measurement)
-                
-                # 目標チェック
-                if not self._latency_logger.check_target(500.0):
-                    logger.warning(f"⚠ レイテンシが目標 (500ms) を超過: {measurement.total_latency_ms:.2f}ms")
+                    # IME を無効化するため少し待機
+                    time.sleep(0.05)
+                    
+                    # テキスト注入
+                    timer.mark(MeasurementPoint.INJECTION_START)
+                    injection_result = self._injector.inject_with_ime_workaround(clean_text)
+                    timer.mark(MeasurementPoint.INJECTION_END)
+                    
+                    if injection_result.success:
+                        logger.info(f"✓ テキスト注入完了 ({len(clean_text)} 文字)")
+                    else:
+                        logger.warning(f"テキスト注入に失敗: {injection_result.failed_characters}")
+                        
+                    # レイテンシ記録
+                    measurement = timer.get_measurement(text_length=len(clean_text))
+                    self._latency_logger.log(measurement)
+                    
+                    # 目標チェック
+                    if not self._latency_logger.check_target(500.0):
+                        logger.warning(f"⚠ レイテンシが目標 (500ms) を超過: {measurement.total_latency_ms:.2f}ms")
+                else:
+                    logger.debug(f"無効なテキストをスキップ: {clean_text}")
                     
         except Exception as e:
             logger.error(f"音声処理エラー: {e}")
+            
+    def _is_valid_text(self, text: str) -> bool:
+        """
+        テキストが有効かどうかを判定
+        
+        Args:
+            text: 判定するテキスト
+            
+        Returns:
+            True if 有効なテキスト
+        """
+        if not text or len(text) < 1:
+            return False
+            
+        # 幻覚的なパターンを除外
+        hallucination_patterns = [
+            "ご視聴ありがとうございました",
+            "チャンネル登録",
+            "お願いします",
+            "ご静聴",
+            "♪",
+            "...",
+        ]
+        
+        for pattern in hallucination_patterns:
+            if pattern in text:
+                return False
+                
+        return True
             
     def run(self) -> None:
         """エージェントを実行"""
@@ -197,33 +238,35 @@ class VoiceInputAgent:
         
         logger.info(f"音声入力エージェント起動")
         logger.info(f"ホットキー: {self.hotkey_config}")
-        logger.info(f"終了: Ctrl+C")
+        logger.info(f"終了: Ctrl+C またはターミナルを閉じる")
         
         self._running = True
+        self._stop_event.clear()
         self._hotkey_manager.start()
         
         try:
-            # シグナルハンドラ
-            signal.signal(signal.SIGINT, self._signal_handler)
-            
-            # メインループ
-            while self._running:
-                signal.pause() if hasattr(signal, 'pause') else __import__('time').sleep(0.1)
-                
-        except KeyboardInterrupt:
-            pass
+            # Windows 対応のメインループ（sleep ベース）
+            while self._running and not self._stop_event.is_set():
+                try:
+                    time.sleep(0.1)
+                except KeyboardInterrupt:
+                    logger.info("Ctrl+C を検出、停止中...")
+                    break
+                    
+        except Exception as e:
+            logger.error(f"メインループエラー: {e}")
         finally:
             self.stop()
             
-    def _signal_handler(self, signum, frame):
-        """シグナルハンドラ"""
-        self._running = False
-        
     def stop(self) -> None:
         """エージェントを停止"""
+        if not self._running:
+            return
+            
         logger.info("エージェントを停止中...")
         
         self._running = False
+        self._stop_event.set()
         
         if self._recording_toggle and self._recording_toggle.is_recording:
             self._recording_toggle.stop()
@@ -266,7 +309,7 @@ def show_devices():
 def main():
     """メイン関数"""
     print("=" * 60)
-    print("ローカルファースト音声入力エージェント v0.1.0")
+    print("ローカルファースト音声入力エージェント v0.1.1")
     print("=" * 60)
     print()
     
@@ -289,6 +332,8 @@ def main():
     
     try:
         agent.run()
+    except KeyboardInterrupt:
+        logger.info("終了します...")
     except Exception as e:
         logger.error(f"エラー: {e}")
         return 1
