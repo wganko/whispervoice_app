@@ -85,12 +85,20 @@ class WhisperStreamProcessor:
         """モデルをロード"""
         if self._model is None:
             from faster_whisper import WhisperModel
+            import logging
+            logger = logging.getLogger(__name__)
             
+            logger.info(f"Whisper モデルをロード中: {self.model_size}")
             self._model = WhisperModel(
                 self.model_size,
                 device=self.device,
                 compute_type=self.compute_type
             )
+            logger.info("Whisper モデルのロード完了")
+            
+    def preload(self) -> None:
+        """モデルを事前ロード（起動時に呼び出す）"""
+        self._load_model()
             
     def _bytes_to_float32(self, audio_bytes: bytes) -> np.ndarray:
         """

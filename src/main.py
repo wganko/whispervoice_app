@@ -37,7 +37,7 @@ class VoiceInputAgent:
         self,
         hotkey_config: Optional[HotkeyConfig] = None,
         use_silero_vad: bool = True,
-        whisper_model_size: str = "tiny"
+        whisper_model_size: str = "base"
     ):
         """
         Args:
@@ -88,14 +88,18 @@ class VoiceInputAgent:
             self._vad = SimpleEnergyVAD()
             logger.info("エネルギーベース VAD を使用")
             
-        # STT (高速化のため beam_size=1)
+        # STT (beam_size=3 で品質と速度のバランス)
         self._stt = WhisperStreamProcessor(
             model_size=self.whisper_model_size,
             device="cpu",
             compute_type="int8",
             language="ja",
-            beam_size=1  # 高速化
+            beam_size=3
         )
+        
+        # モデルを事前ロード（初回リクエストの遅延を回避）
+        logger.info("音声認識モデルをプリロード中...")
+        self._stt.preload()
         
         # テキスト注入（IME 対応のため遅延を追加）
         self._injector = TextInjector(delay_between_chars_ms=5.0)
@@ -323,7 +327,7 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description="ローカルファースト音声入力エージェント")
     parser.add_argument("--list-devices", action="store_true", help="デバイス一覧を表示")
-    parser.add_argument("--model", default="tiny", help="Whisper モデルサイズ (tiny, base, small, medium)")
+    parser.add_argument("--model", default="base", help="Whisper モデルサイズ (tiny, base, small, medium)")
     parser.add_argument("--no-silero", action="store_true", help="Silero VAD を使用しない")
     args = parser.parse_args()
     
