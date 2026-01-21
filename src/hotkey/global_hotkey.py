@@ -1,34 +1,42 @@
 """
 グローバルホットキーモジュール
 
-システム全体で有効なホットキーを登録し、
+pynput を使用してシステム全体で有効なホットキーを登録し、
 録音の開始/停止をトグル制御する。
 """
 
-import ctypes
-from ctypes import wintypes
 import threading
-from typing import Optional, Callable, Dict
+from typing import Optional, Callable, Set
 from dataclasses import dataclass
-from enum import IntEnum
+from enum import Enum
+import logging
+
+from pynput import keyboard
+
+logger = logging.getLogger(__name__)
 
 
-# 仮想キーコード
-class VK(IntEnum):
-    """仮想キーコード定数"""
-    LBUTTON = 0x01
-    RBUTTON = 0x02
-    CANCEL = 0x03
-    BACK = 0x08
-    TAB = 0x09
-    RETURN = 0x0D
-    SHIFT = 0x10
-    CONTROL = 0x11
-    MENU = 0x12  # Alt
-    PAUSE = 0x13
-    CAPITAL = 0x14
-    ESCAPE = 0x1B
-    SPACE = 0x20
+class KeyCode(Enum):
+    """ホットキー用キーコード"""
+    F1 = keyboard.Key.f1
+    F2 = keyboard.Key.f2
+    F3 = keyboard.Key.f3
+    F4 = keyboard.Key.f4
+    F5 = keyboard.Key.f5
+    F6 = keyboard.Key.f6
+    F7 = keyboard.Key.f7
+    F8 = keyboard.Key.f8
+    F9 = keyboard.Key.f9
+    F10 = keyboard.Key.f10
+    F11 = keyboard.Key.f11
+    F12 = keyboard.Key.f12
+    SPACE = keyboard.Key.space
+    ESCAPE = keyboard.Key.esc
+
+
+# 後方互換性のための仮想キーコード
+class VK:
+    """仮想キーコード定数（後方互換性）"""
     F1 = 0x70
     F2 = 0x71
     F3 = 0x72
@@ -43,9 +51,8 @@ class VK(IntEnum):
     F12 = 0x7B
 
 
-# モディファイアフラグ
-class MOD(IntEnum):
-    """ホットキーモディファイアフラグ"""
+class MOD:
+    """モディファイアフラグ（後方互換性）"""
     ALT = 0x0001
     CONTROL = 0x0002
     SHIFT = 0x0004
@@ -56,8 +63,8 @@ class MOD(IntEnum):
 @dataclass
 class HotkeyConfig:
     """ホットキー設定"""
-    key: int  # 仮想キーコード
-    modifiers: int  # モディファイアフラグの組み合わせ
+    key: int  # 仮想キーコード（VK.F8 など）
+    modifiers: int = 0  # モディファイアフラグの組み合わせ
     description: str = ""
     
     def __str__(self) -> str:
@@ -79,46 +86,44 @@ class HotkeyConfig:
         
     def _get_key_name(self) -> str:
         """キー名を取得"""
-        for vk in VK:
-            if vk.value == self.key:
-                return vk.name
-        if 0x30 <= self.key <= 0x39:
-            return chr(self.key)
-        if 0x41 <= self.key <= 0x5A:
-            return chr(self.key)
-        return f"0x{self.key:02X}"
+        key_names = {
+            VK.F1: "F1", VK.F2: "F2", VK.F3: "F3", VK.F4: "F4",
+            VK.F5: "F5", VK.F6: "F6", VK.F7: "F7", VK.F8: "F8",
+            VK.F9: "F9", VK.F10: "F10", VK.F11: "F11", VK.F12: "F12",
+        }
+        return key_names.get(self.key, f"0x{self.key:02X}")
+    
+    def to_pynput_key(self) -> keyboard.Key:
+        """pynput のキーに変換"""
+        mapping = {
+            VK.F1: keyboard.Key.f1,
+            VK.F2: keyboard.Key.f2,
+            VK.F3: keyboard.Key.f3,
+            VK.F4: keyboard.Key.f4,
+            VK.F5: keyboard.Key.f5,
+            VK.F6: keyboard.Key.f6,
+            VK.F7: keyboard.Key.f7,
+            VK.F8: keyboard.Key.f8,
+            VK.F9: keyboard.Key.f9,
+            VK.F10: keyboard.Key.f10,
+            VK.F11: keyboard.Key.f11,
+            VK.F12: keyboard.Key.f12,
+        }
+        return mapping.get(self.key, keyboard.Key.f8)
 
 
 class GlobalHotkeyManager:
     """
-    グローバルホットキーマネージャー
+    グローバルホットキーマネージャー（pynput ベース）
     
-    Win32 RegisterHotKey API を使用してシステム全体で有効な
-    ホットキーを登録・管理する。
-    
-    Usage:
-        manager = GlobalHotkeyManager()
-        manager.register(
-            hotkey_id=1,
-            config=HotkeyConfig(key=VK.F8, modifiers=0),
-            callback=on_recording_toggle
-        )
-        manager.start()
-        # ... アプリケーション実行中 ...
-        manager.stop()
+    pynput を使用してシステム全体で有効なホットキーを登録・管理する。
     """
     
-    # Windows メッセージ
-    WM_HOTKEY = 0x0312
-    
     def __init__(self):
-        self._hotkeys: Dict[int, tuple[HotkeyConfig, Callable]] = {}
+        self._hotkeys: dict[int, tuple[HotkeyConfig, Callable]] = {}
         self._running = False
-        self._thread: Optional[threading.Thread] = None
-        self._stop_event = threading.Event()
-        
-        # Windows API
-        self._user32 = ctypes.windll.user32
+        self._listener: Optional[keyboard.Listener] = None
+        self._pressed_modifiers: Set[keyboard.Key] = set()
         
     def register(
         self,
@@ -126,125 +131,100 @@ class GlobalHotkeyManager:
         config: HotkeyConfig,
         callback: Callable[[], None]
     ) -> bool:
-        """
-        ホットキーを登録
-        
-        Args:
-            hotkey_id: ホットキーの ID（一意である必要がある）
-            config: ホットキー設定
-            callback: ホットキー押下時のコールバック
-            
-        Returns:
-            登録成功したかどうか
-        """
-        # メッセージループスレッドで登録する必要がある
+        """ホットキーを登録"""
         self._hotkeys[hotkey_id] = (config, callback)
-        
-        if self._running:
-            # 実行中の場合は直接登録
-            return self._register_hotkey(hotkey_id, config)
-            
+        logger.info(f"ホットキー登録: ID={hotkey_id}, キー={config}")
         return True
-        
-    def _register_hotkey(self, hotkey_id: int, config: HotkeyConfig) -> bool:
-        """Windows API でホットキーを登録"""
-        result = self._user32.RegisterHotKey(
-            None,
-            hotkey_id,
-            config.modifiers,
-            config.key
-        )
-        return result != 0
         
     def unregister(self, hotkey_id: int) -> bool:
-        """
-        ホットキーを解除
-        
-        Args:
-            hotkey_id: ホットキーの ID
-            
-        Returns:
-            解除成功したかどうか
-        """
+        """ホットキーを解除"""
         if hotkey_id in self._hotkeys:
             del self._hotkeys[hotkey_id]
-            
-        if self._running:
-            return self._unregister_hotkey(hotkey_id)
-            
-        return True
+            return True
+        return False
         
-    def _unregister_hotkey(self, hotkey_id: int) -> bool:
-        """Windows API でホットキーを解除"""
-        result = self._user32.UnregisterHotKey(None, hotkey_id)
-        return result != 0
+    def _on_press(self, key) -> None:
+        """キー押下時のコールバック"""
+        # モディファイアキーを追跡
+        if key in (keyboard.Key.ctrl_l, keyboard.Key.ctrl_r):
+            self._pressed_modifiers.add(keyboard.Key.ctrl_l)
+        elif key in (keyboard.Key.alt_l, keyboard.Key.alt_r):
+            self._pressed_modifiers.add(keyboard.Key.alt_l)
+        elif key in (keyboard.Key.shift_l, keyboard.Key.shift_r):
+            self._pressed_modifiers.add(keyboard.Key.shift_l)
+        elif key in (keyboard.Key.cmd_l, keyboard.Key.cmd_r):
+            self._pressed_modifiers.add(keyboard.Key.cmd_l)
+            
+        # 登録されたホットキーをチェック
+        for hotkey_id, (config, callback) in self._hotkeys.items():
+            target_key = config.to_pynput_key()
+            
+            # キーが一致するかチェック
+            if key == target_key:
+                # モディファイアをチェック
+                ctrl_required = config.modifiers & MOD.CONTROL
+                alt_required = config.modifiers & MOD.ALT
+                shift_required = config.modifiers & MOD.SHIFT
+                win_required = config.modifiers & MOD.WIN
+                
+                ctrl_pressed = keyboard.Key.ctrl_l in self._pressed_modifiers
+                alt_pressed = keyboard.Key.alt_l in self._pressed_modifiers
+                shift_pressed = keyboard.Key.shift_l in self._pressed_modifiers
+                win_pressed = keyboard.Key.cmd_l in self._pressed_modifiers
+                
+                # モディファイアが0の場合は単独キー
+                if config.modifiers == 0:
+                    # モディファイアなしの場合
+                    logger.info(f"ホットキー検出: {config}")
+                    try:
+                        callback()
+                    except Exception as e:
+                        logger.error(f"ホットキーコールバックエラー: {e}")
+                elif (bool(ctrl_required) == ctrl_pressed and
+                      bool(alt_required) == alt_pressed and
+                      bool(shift_required) == shift_pressed and
+                      bool(win_required) == win_pressed):
+                    logger.info(f"ホットキー検出: {config}")
+                    try:
+                        callback()
+                    except Exception as e:
+                        logger.error(f"ホットキーコールバックエラー: {e}")
+                        
+    def _on_release(self, key) -> None:
+        """キー解放時のコールバック"""
+        # モディファイアキーを追跡から削除
+        if key in (keyboard.Key.ctrl_l, keyboard.Key.ctrl_r):
+            self._pressed_modifiers.discard(keyboard.Key.ctrl_l)
+        elif key in (keyboard.Key.alt_l, keyboard.Key.alt_r):
+            self._pressed_modifiers.discard(keyboard.Key.alt_l)
+        elif key in (keyboard.Key.shift_l, keyboard.Key.shift_r):
+            self._pressed_modifiers.discard(keyboard.Key.shift_l)
+        elif key in (keyboard.Key.cmd_l, keyboard.Key.cmd_r):
+            self._pressed_modifiers.discard(keyboard.Key.cmd_l)
         
     def start(self) -> None:
         """ホットキーリスナーを開始"""
         if self._running:
             return
             
-        self._stop_event.clear()
         self._running = True
-        self._thread = threading.Thread(target=self._message_loop, daemon=True)
-        self._thread.start()
+        self._listener = keyboard.Listener(
+            on_press=self._on_press,
+            on_release=self._on_release
+        )
+        self._listener.start()
+        logger.info("ホットキーリスナー開始")
         
     def stop(self) -> None:
         """ホットキーリスナーを停止"""
         if not self._running:
             return
             
-        self._stop_event.set()
-        
-        # PostThreadMessage で WM_QUIT を送信してループを抜ける
-        if self._thread:
-            self._user32.PostThreadMessageW(
-                self._thread.ident,
-                0x0012,  # WM_QUIT
-                0,
-                0
-            )
-            self._thread.join(timeout=2.0)
-            
         self._running = False
-        
-    def _message_loop(self) -> None:
-        """Windows メッセージループ"""
-        # すべてのホットキーを登録
-        for hotkey_id, (config, _) in self._hotkeys.items():
-            self._register_hotkey(hotkey_id, config)
-            
-        # メッセージ構造体
-        msg = wintypes.MSG()
-        
-        while not self._stop_event.is_set():
-            # PeekMessage で非ブロッキングでメッセージを取得
-            result = self._user32.PeekMessageW(
-                ctypes.byref(msg),
-                None,
-                0,
-                0,
-                0x0001  # PM_REMOVE
-            )
-            
-            if result:
-                if msg.message == self.WM_HOTKEY:
-                    hotkey_id = msg.wParam
-                    if hotkey_id in self._hotkeys:
-                        _, callback = self._hotkeys[hotkey_id]
-                        try:
-                            callback()
-                        except Exception as e:
-                            print(f"Hotkey callback error: {e}")
-                elif msg.message == 0x0012:  # WM_QUIT
-                    break
-            else:
-                # メッセージがない場合は少し待機
-                self._stop_event.wait(0.01)
-                
-        # すべてのホットキーを解除
-        for hotkey_id in self._hotkeys:
-            self._unregister_hotkey(hotkey_id)
+        if self._listener:
+            self._listener.stop()
+            self._listener = None
+        logger.info("ホットキーリスナー停止")
             
     @property
     def is_running(self) -> bool:
@@ -253,33 +233,19 @@ class GlobalHotkeyManager:
 
 
 class RecordingToggle:
-    """
-    録音トグル制御
-    
-    ホットキーによる録音開始/停止のトグル制御を行う。
-    """
+    """録音トグル制御"""
     
     def __init__(
         self,
         on_start: Optional[Callable[[], None]] = None,
         on_stop: Optional[Callable[[], None]] = None
     ):
-        """
-        Args:
-            on_start: 録音開始時のコールバック
-            on_stop: 録音停止時のコールバック
-        """
         self.on_start = on_start
         self.on_stop = on_stop
         self._is_recording = False
         
     def toggle(self) -> bool:
-        """
-        録音状態をトグル
-        
-        Returns:
-            トグル後の録音状態（True=録音中）
-        """
+        """録音状態をトグル"""
         if self._is_recording:
             self._is_recording = False
             if self.on_stop:
@@ -288,23 +254,19 @@ class RecordingToggle:
             self._is_recording = True
             if self.on_start:
                 self.on_start()
-                
         return self._is_recording
         
     @property
     def is_recording(self) -> bool:
-        """録音中かどうか"""
         return self._is_recording
         
     def start(self) -> None:
-        """録音を開始"""
         if not self._is_recording:
             self._is_recording = True
             if self.on_start:
                 self.on_start()
                 
     def stop(self) -> None:
-        """録音を停止"""
         if self._is_recording:
             self._is_recording = False
             if self.on_stop:
